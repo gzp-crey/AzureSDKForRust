@@ -15,3 +15,5 @@ mod table_entity;
 pub use table_entity::*;
 mod batch;
 pub use batch::*;
+
+pub mod deserialize;

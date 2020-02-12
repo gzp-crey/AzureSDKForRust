@@ -8,7 +8,6 @@ use futures::stream::Stream;
 use hyper::{header, Method, StatusCode};
 use log;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json;
 use std::convert::TryFrom;
 
 /// Represents a table in the Microsoft Azure Table service.
@@ -85,7 +84,7 @@ impl CloudTable {
             timestamp: None,
             payload,
         };
-        let obj_ser = serde_json::to_string(&entity)?.to_owned();
+        let obj_ser = entity.to_payload()?;
 
         let future_response = self.client.request_with_default_header(
             &self.table_name,
@@ -131,7 +130,7 @@ impl CloudTable {
             timestamp: None,
             payload,
         };
-        let obj_ser = serde_json::to_string(&entity)?.to_owned();
+        let obj_ser = entity.to_payload()?;
         let path = &entity_path(&self.table_name, &entity.partition_key, &entity.row_key);
         let future_response = self.client.request_with_default_header(
             &path,
@@ -173,7 +172,7 @@ impl CloudTable {
     where
         T: Serialize + DeserializeOwned,
     {
-        let obj_ser = serde_json::to_string(&entity)?.to_owned();
+        let obj_ser = entity.to_payload()?;
         let path = &entity_path(&self.table_name, &entity.partition_key, &entity.row_key);
         let etag = entity.etag;
         let future_response = self.client.request_with_default_header(
@@ -278,9 +277,9 @@ impl CloudTable {
             check_status_extract_headers_and_body(future_response, StatusCode::OK).await?;
 
         log::trace!("body == {:?}", std::str::from_utf8(&body));
-        let entities = serde_json::from_slice::<EntityCollection<T>>(&body)?;
+        let entities = TableEntity::from_payload_set(&body)?;
         *continuation = Continuation::try_from(&headers)?;
-        Ok(Some(entities.value))
+        Ok(Some(entities))
     }
 
     pub fn stream_query<'a, T>(
@@ -317,11 +316,6 @@ impl CloudTable {
         // info!("{}", body);
         Ok(())
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct EntityCollection<T> {
-    value: Vec<TableEntity<T>>,
 }
 
 #[derive(Debug, Clone)]

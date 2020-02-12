@@ -1,31 +1,24 @@
+use crate::deserialize::Meta;
 use azure_sdk_core::errors::AzureError;
 use chrono::{DateTime, Utc};
 use http::header;
 use http::HeaderMap;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json;
+use serde::{de::DeserializeOwned, ser::SerializeStruct, Deserialize, Serialize, Serializer};
+use serde_json::{
+    self,
+    ser::{Formatter, Serializer as JSONSerializer},
+};
+use std::io;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct NoData {}
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone)]
 pub struct TableEntity<T> {
-    #[serde(rename = "RowKey")]
     pub row_key: String,
-    #[serde(rename = "PartitionKey")]
     pub partition_key: String,
-
-    #[serde(skip_serializing, rename = "odata.etag")]
     pub etag: Option<String>,
-
-    #[serde(
-        skip_serializing,
-        deserialize_with = "deserialize::optional_timestamp",
-        rename = "Timestamp"
-    )]
     pub timestamp: Option<DateTime<Utc>>,
-
-    #[serde(flatten)]
     pub payload: T,
 }
 
@@ -41,7 +34,7 @@ where
         log::trace!("headers == {:?}", headers);
         log::trace!("body == {:?}", std::str::from_utf8(body));
 
-        let mut entity: Self = serde_json::from_slice(&body)?;
+        let mut entity = Self::from_payload(body)?;
 
         if let Some(etag) = headers.get(header::ETAG) {
             entity.etag = Some(etag.to_str()?.to_owned());
@@ -97,70 +90,121 @@ impl std::convert::TryFrom<&HeaderMap> for Continuation {
     }
 }
 
-/// Helper functions to (de)serialize entity properties
-mod deserialize {
-    use chrono::{DateTime, Utc};
-    use serde::{
-        de::{Error, Visitor},
-        Deserializer,
-    };
-    use std::fmt;
+// Formatter that flattens a nested structure
+struct FlattenFormatter(usize);
 
-    struct TimestampVisitor;
-
-    pub fn deserialize<'de, D>(d: D) -> Result<DateTime<Utc>, D::Error>
+impl Formatter for FlattenFormatter {
+    #[inline]
+    fn begin_array<W: ?Sized>(&mut self, _writer: &mut W) -> io::Result<()>
     where
-        D: Deserializer<'de>,
+        W: io::Write,
     {
-        d.deserialize_str(TimestampVisitor)
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Array serialization is not supported",
+        ))
     }
 
-    impl<'de> Visitor<'de> for TimestampVisitor {
-        type Value = DateTime<Utc>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            write!(formatter, "a timestamp string")
-        }
-
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: Error,
-        {
-            match value.parse::<DateTime<Utc>>() {
-                Ok(date) => Ok(date),
-                Err(e) => Err(E::custom(format!("Parse error {} for {}", e, value))),
-            }
-        }
-    }
-
-    struct OptionalTimestampVisitor;
-
-    impl<'de> Visitor<'de> for OptionalTimestampVisitor {
-        type Value = Option<DateTime<Utc>>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            write!(formatter, "null or a timestamp string")
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_some<D>(self, d: D) -> Result<Option<DateTime<Utc>>, D::Error>
-        where
-            D: Deserializer<'de>,
-        {
-            Ok(Some(d.deserialize_str(TimestampVisitor)?))
-        }
-    }
-
-    pub fn optional_timestamp<'de, D>(d: D) -> Result<Option<DateTime<Utc>>, D::Error>
+    #[inline]
+    fn begin_object<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
     where
-        D: Deserializer<'de>,
+        W: io::Write,
     {
-        d.deserialize_option(OptionalTimestampVisitor)
+        self.0 += 1;
+        if self.0 == 1 {
+            //meta start
+            writer.write_all(b"{")
+        } else if self.0 == 2 {
+            // payload start
+            writer.write_all(b",")
+        } else {
+            // nesting in payload
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Nested structures are not supported, try to use #[serde(flatten)]",
+            ))
+        }
+    }
+
+    #[inline]
+    fn end_object<W: ?Sized>(&mut self, writer: &mut W) -> io::Result<()>
+    where
+        W: io::Write,
+    {
+        if self.0 == 2 {
+            // payload end
+            writer.write_all(b"}")
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Serialize TableEntity for message payloads
+impl<T> TableEntity<T>
+where
+    T: Serialize,
+{
+    pub fn to_payload(&self) -> Result<String, AzureError> {
+        let writer = Vec::with_capacity(128);
+        let mut ser = JSONSerializer::with_formatter(writer, FlattenFormatter(0));
+        {
+            let mut s = ser.serialize_struct("Meta", 2)?;
+            s.serialize_field("PartitionKey", &self.partition_key)?;
+            s.serialize_field("RowKey", &self.row_key)?;
+            s.end()?;
+        }
+        self.payload.serialize(&mut ser)?;
+        let string = String::from_utf8(ser.into_inner())?;
+        Ok(string)
+    }
+}
+
+#[derive(Deserialize)]
+struct MetaValues {
+    values: Vec<Meta>,
+}
+
+#[derive(Deserialize)]
+struct PayloadValues<'de, T>
+where
+    T: Deserialize<'de>,
+{
+    values: Vec<T>,
+}
+
+impl<T> TableEntity<T>
+where
+    T: DeserializeOwned,
+{
+    pub fn from_payload(data: &[u8]) -> Result<Self, AzureError> {
+        let meta: Meta = serde_json::from_slice(data)?;
+        let payload: T = serde_json::from_slice(data)?;
+        Ok(Self {
+            partition_key: meta.partition_key,
+            row_key: meta.row_key,
+            etag: meta.etag,
+            timestamp: meta.timestamp,
+            payload: payload,
+        })
+    }
+
+    pub fn from_payload_set(data: &[u8]) -> Result<Vec<Self>, AzureError> {
+        let meta: MetaValues = serde_json::from_slice(data)?;
+        let meta = meta.values;
+        let payload: PayloadValues<Self> = serde_json::from_slice(data)?;
+        let payload = payload.values;
+        let mut v = Vec::with_capacity(meta.len());
+        for (m, p) in meta.into_iter().zip(payload.into_iter()) {
+            v.push(Self {
+                partition_key: m.partition_key,
+                row_key: m.row_key,
+                etag: m.etag,
+                timestamp: m.timestamp,
+                payload: p,
+            });
+        }
+
+        Ok(v)
     }
 }

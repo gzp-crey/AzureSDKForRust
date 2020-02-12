@@ -36,9 +36,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("segemnt len: {}", entities.len());
         for entity in entities {
             count += 1;
-            println!("before {:?}", entity);
+            let l = count % 100 == 0;
+            if l {
+                println!("before {:?}", entity);
+            }
             let entity = to_table.insert_entity(entity).await?;
-            println!("after {:?}", entity);
+            if l {
+                println!("after {:?}", entity);
+            }
         }
     }
     println!(

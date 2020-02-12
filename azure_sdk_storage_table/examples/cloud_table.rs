@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate serde_derive;
 
-use azure_sdk_storage_table::{CloudTable, Continuation, TableClient};
+use azure_sdk_storage_table::{CloudTable, Continuation, TableClient, TableEntity};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 
@@ -25,11 +25,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let entity = cloud_table.get::<MyEntity>("pk", "rk").await?;
     println!("entity: {:?}", entity);
 
-    for r in 0usize..2000 {
+    let count = 2000;
+    for r in 0usize..count {
         let pk = "big2";
         let rk = &format!("{}", r);
-        println!("delete {}:{}", pk, rk);
-        let _ = cloud_table.delete(pk, rk, None).await;
+        let l = r % 100 == 0;
+        if l {
+            println!("insert {}:{}", pk, rk);
+        }
+        let r = cloud_table
+            .insert(
+                pk,
+                rk,
+                MyEntity {
+                    data: "hello".to_owned(),
+                },
+            )
+            .await?;
+        if l {
+            println!("insert {:?}", r);
+        }
     }
 
     let mut cont = Continuation::start();
@@ -38,6 +53,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?
     {
         println!("segment: {:?}", entities.first());
+    }
+
+    for r in 0usize..count {
+        let pk = "big2";
+        let rk = &format!("{}", r);
+        let l = r % 100 == 0;
+        if l {
+            println!("delete {}:{}", pk, rk);
+        }
+        cloud_table.delete(pk, rk, None).await?;
     }
 
     Ok(())
